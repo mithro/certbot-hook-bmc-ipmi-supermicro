@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=python
+
+# This file is part of Supermicro IPMI certificate updater.
+# Supermicro IPMI certificate updater is free software: you can
+# redistribute it and/or modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation, version 2.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, write to the Free Software Foundation, Inc., 51
+# Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Copyright (c) Jari Turkia
+
+
+import os
+import argparse
+import requests
+from datetime import datetime
+from lxml import etree
+
+REQUEST_TIMEOUT = 5.0
+
+LOGIN_URL = '%s/cgi/login.cgi'
+IPMI_CERT_INFO_URL = '%s/cgi/ipmi.cgi'
+UPLOAD_CERT_URL = '%s/cgi/upload_ssl.cgi'
+REBOOT_IPMI_URL = '%s/cgi/url_redirect.cgi?url_name=config_ssl_fw_reset'
+
+
+def login(session, url, username, password):
+    """
+    Log into IPMI interface
+    :param session: Current session object
+    :type session requests.session
+    :param url: base-URL to IPMI
+    :param username: username to use for logging in
+    :param password: password to use for logging in
+    :return: bool
+    """
+    login_data = {
+        'name': username,
+        'pwd': password
+    }
+
+    login_url = LOGIN_URL % url
+    try:
+        result = session.post(login_url, login_data, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+    if not result.ok:
+        return False
+    if '/cgi/url_redirect.cgi?url_name=mainmenu' not in result.text:
+        return False
+
+    return True
+
+
+def get_ipmi_cert_info(session, url):
+    """
+    Verify existing certificate information
+    :param session: Current session object
+    :type session requests.session
+    :param url: base-URL to IPMI
+    :return: dict
+    """
+    timestamp = datetime.utcnow().strftime('%a %d %b %Y %H:%M:%S GMT')
+
+    cert_info_data = {
+        'SSL_STATUS.XML': '(0,0)',
+        'time_stamp': timestamp  # 'Thu Jul 12 2018 19:52:48 GMT+0300 (FLE Daylight Time)'
+    }
+
+    ipmi_info_url = IPMI_CERT_INFO_URL % url
+    try:
+        result = session.post(ipmi_info_url, cert_info_data, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+    if not result.ok:
+        return False
+
+    root = etree.fromstring(result.text)
+    # <?xml> <IPMI> <SSL_INFO> <STATUS>
+    status = root.xpath('//IPMI/SSL_INFO/STATUS')
+    if not status:
+        return False
+    # Since xpath will return a list, just pick the first one from it.
+    status = status[0]
+    has_cert = int(status.get('CERT_EXIST'))
+    has_cert = bool(has_cert)
+    if has_cert:
+        valid_from = status.get('VALID_FROM')
+        valid_until = status.get('VALID_UNTIL')
+
+    return {
+        'has_cert': has_cert,
+        'valid_from': valid_from,
+        'valid_until': valid_until
+    }
+
+
+def upload_cert(session, url, key_file, cert_file):
+    """
+    Send X.509 certificate and private key to server
+    :param session: Current session object
+    :type session requests.session
+    :param url: base-URL to IPMI
+    :param key_file: filename to X.509 certificate private key
+    :param cert_file: filename to X.509 certificate PEM
+    :return:
+    """
+    with open(key_file, 'rb') as filehandle:
+        key_data = filehandle.read()
+    with open(cert_file, 'rb') as filehandle:
+        cert_data = filehandle.read()
+    files_to_upload = [
+        ('/tmp/key.pem', ('/tmp/key.pem', key_data, 'application/octet-stream')),
+        ('/tmp/cert.pem', ('/tmp/cert.pem', cert_data, 'application/x-x509-ca-cert'))
+    ]
+
+    upload_cert_url = UPLOAD_CERT_URL % url
+    try:
+        result = session.post(upload_cert_url, files=files_to_upload, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+    if not result.ok:
+        return False
+
+    if 'Content-Type' not in result.headers.keys() or result.headers['Content-Type'] != 'text/html':
+        # On failure, Content-Type will be 'text/plain' and 'Transfer-Encoding' is 'chunked'
+        return False
+    if 'CONFPAGE_RESET' not in result.text:
+        return False
+
+    return True
+
+
+def reboot_ipmi(session, url):
+    upload_cert_url = REBOOT_IPMI_URL % url
+    try:
+        result = session.get(upload_cert_url, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+    if not result.ok:
+        return False
+
+    if 'LANG_FW_RESET_DESC1' not in result.text:
+        return False
+
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Update Supermicro IPMI SSL certificate')
+    parser.add_argument('--ipmi-url', required=True,
+                        help='Supermicro IPMI 2.0 URL')
+    parser.add_argument('--key-file', required=True,
+                        help='X.509 Private key filename')
+    parser.add_argument('--cert-file', required=True,
+                        help='X.509 Certificate filename')
+    parser.add_argument('--username', required=True,
+                        help='IPMI username with admin access')
+    parser.add_argument('--password', required=True,
+                        help='IPMI user password')
+    parser.add_argument('--no-reboot',
+                        help='The default is to reboot the IPMI after upload for the change to take effect.')
+    args = parser.parse_args()
+
+    # Confirm args
+    if not os.path.isfile(args.key_file):
+        print("--key-file '%s' doesn't exist!" % args.key_file)
+        exit(2)
+    if not os.path.isfile(args.cert_file):
+        print("--cert-file '%s' doesn't exist!" % args.cert_file)
+        exit(2)
+    if args.ipmi_url[-1] == '/':
+        args.ipmi_url = args.ipmi_url[0:-1]
+
+    # Start the operation
+    requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+    session = requests.session()
+    if not login(session, args.ipmi_url, args.username, args.password):
+        print("Login failed. Cannot continue!")
+        exit(2)
+    cert_info = get_ipmi_cert_info(session, args.ipmi_url)
+    if not cert_info:
+        print("Failed to extract certificate information from IPMI!")
+        exit(2)
+    if cert_info['has_cert']:
+        print("There exists a certificate, which is valid until: %s" % cert_info['valid_until'])
+
+    # Go upload!
+    if not upload_cert(session, args.ipmi_url, args.key_file, args.cert_file):
+        print("Failed to upload X.509 files to IPMI!")
+        exit(2)
+
+    print("Uploaded files ok.")
+    if not args.no_reboot:
+        print("Rebooting IPMI to apply changes.")
+        if not reboot_ipmi(session, args.ipmi_url):
+            print("Rebooting failed! Go reboot it manually?")
+
+    print("All done!")
+
+
+if __name__ == "__main__":
+    main()
