@@ -24,13 +24,15 @@ import argparse
 import requests
 from datetime import datetime
 from lxml import etree
+from urllib.parse import urlparse
 
 REQUEST_TIMEOUT = 5.0
 
 LOGIN_URL = '%s/cgi/login.cgi'
 IPMI_CERT_INFO_URL = '%s/cgi/ipmi.cgi'
 UPLOAD_CERT_URL = '%s/cgi/upload_ssl.cgi'
-REBOOT_IPMI_URL = '%s/cgi/url_redirect.cgi?url_name=config_ssl_fw_reset'
+REBOOT_IPMI_URL = '%s/cgi/BMCReset.cgi'
+CONFIG_CERT_URL = '%s/cgi/url_redirect.cgi?url_name=config_ssl'
 
 
 def login(session, url, username, password):
@@ -76,6 +78,8 @@ def get_ipmi_cert_info(session, url):
         'time_stamp': timestamp  # 'Thu Jul 12 2018 19:52:48 GMT+0300 (FLE Daylight Time)'
     }
 
+    for cookie in session.cookies:
+        print(cookie)
     ipmi_info_url = IPMI_CERT_INFO_URL % url
     try:
         result = session.post(ipmi_info_url, cert_info_data, timeout=REQUEST_TIMEOUT, verify=False)
@@ -119,8 +123,8 @@ def upload_cert(session, url, key_file, cert_file):
     with open(cert_file, 'rb') as filehandle:
         cert_data = filehandle.read()
     files_to_upload = [
-        ('/tmp/key.pem', ('/tmp/key.pem', key_data, 'application/octet-stream')),
-        ('/tmp/cert.pem', ('/tmp/cert.pem', cert_data, 'application/x-x509-ca-cert'))
+        ('/tmp/cert.key', ('cert.key', key_data, 'application/octet-stream')),
+        ('/tmp/cert.pem', ('cert.pem', cert_data, 'application/x-x509-ca-cert'))
     ]
 
     upload_cert_url = UPLOAD_CERT_URL % url
@@ -141,15 +145,24 @@ def upload_cert(session, url, key_file, cert_file):
 
 
 def reboot_ipmi(session, url):
+    timestamp = datetime.utcnow().strftime('%a %d %b %Y %H:%M:%S GMT')
+
+    reboot_data = {
+        'time_stamp': timestamp  # 'Thu Jul 12 2018 19:52:48 GMT+0300 (FLE Daylight Time)'
+    }
+
     upload_cert_url = REBOOT_IPMI_URL % url
     try:
-        result = session.get(upload_cert_url, timeout=REQUEST_TIMEOUT, verify=False)
+        result = session.post(upload_cert_url, reboot_data, timeout=REQUEST_TIMEOUT, verify=False)
     except ConnectionError:
         return False
     if not result.ok:
         return False
 
-    if 'LANG_FW_RESET_DESC1' not in result.text:
+    print("Url: %s" % upload_cert_url)
+    print(result.headers)
+    print(result.text)
+    if '<STATE CODE="OK"/>' not in result.text:
         return False
 
     return True
@@ -187,6 +200,20 @@ def main():
     if not login(session, args.ipmi_url, args.username, args.password):
         print("Login failed. Cannot continue!")
         exit(2)
+
+
+    # Set mandatory cookies:
+    url_parts = urlparse(args.ipmi_url)
+    # Cookie: langSetFlag=0; language=English; SID=<dynamic session ID here!>; mainpage=configuration; subpage=config_ssl
+    mandatory_cookies = {
+        'langSetFlag': '0',
+        'language': 'English',
+        'mainpage': 'configuration',
+        'subpage': 'config_ssl'
+    }
+    for cookie_name, cookie_value in mandatory_cookies.items():
+        session.cookies.set(cookie_name, cookie_value, domain=url_parts.hostname)
+
     cert_info = get_ipmi_cert_info(session, args.ipmi_url)
     if not cert_info:
         print("Failed to extract certificate information from IPMI!")
@@ -200,6 +227,14 @@ def main():
         exit(2)
 
     print("Uploaded files ok.")
+
+    cert_info = get_ipmi_cert_info(session, args.ipmi_url)
+    if not cert_info:
+        print("Failed to extract certificate information from IPMI!")
+        exit(2)
+    if cert_info['has_cert']:
+        print("After upload, there exists a certificate, which is valid until: %s" % cert_info['valid_until'])
+
     if not args.no_reboot:
         print("Rebooting IPMI to apply changes.")
         if not reboot_ipmi(session, args.ipmi_url):
