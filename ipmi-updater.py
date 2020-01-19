@@ -25,13 +25,31 @@ import requests
 from datetime import datetime
 from lxml import etree
 from urllib.parse import urlparse
+import time
+
+# Debug connections
+import logging
+import http.client as http_client
+
+# For overwritten_encode_files()
+from urllib3.fields import RequestField
+from urllib3.filepost import encode_multipart_formdata
+from requests.utils import (
+    guess_filename, get_auth_from_url, requote_uri,
+    stream_decode_response_unicode, to_key_val_list, parse_header_links,
+    iter_slices, guess_json_utf, super_len, check_header_validity)
+from requests.compat import (
+    Callable, Mapping,
+    cookielib, urlunparse, urlsplit, urlencode, str, bytes,
+    is_py2, chardet, builtin_str, basestring)
 
 REQUEST_TIMEOUT = 5.0
 
 LOGIN_URL = '%s/cgi/login.cgi'
-IPMI_CERT_INFO_URL = '%s/cgi/ipmi.cgi'
+IPMI_QUERY_URL = '%s/cgi/ipmi.cgi'
 UPLOAD_CERT_URL = '%s/cgi/upload_ssl.cgi'
 REBOOT_IPMI_URL = '%s/cgi/BMCReset.cgi'
+MAIN_FRAME_URL = '%s/cgi/url_redirect.cgi?url_name=mainmenu'
 CONFIG_CERT_URL = '%s/cgi/url_redirect.cgi?url_name=config_ssl'
 
 
@@ -45,6 +63,17 @@ def login(session, url, username, password):
     :param password: password to use for logging in
     :return: bool
     """
+
+    # Prime
+    try:
+        result = session.get(url, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+
+    if not result.ok:
+        return False
+
+    # Do the actual login
     login_data = {
         'name': username,
         'pwd': password
@@ -60,6 +89,20 @@ def login(session, url, username, password):
     if '/cgi/url_redirect.cgi?url_name=mainmenu' not in result.text:
         return False
 
+    # Prime again
+    frame_url = CONFIG_CERT_URL % url
+    try:
+        result = session.get(frame_url, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+    if not result.ok:
+        return False
+
+    if result.headers['Content-Type'] != 'text/html':
+        return False
+    if '?SSL_STATUS.XML=(0,0)&time_stamp=' not in result.text:
+        return False
+
     return True
 
 
@@ -71,21 +114,27 @@ def get_ipmi_cert_info(session, url):
     :param url: base-URL to IPMI
     :return: dict
     """
+    # SSL_STATUS.XML=(0,0)&time_stamp=Fri Nov 09 2018 18:51:38 GMT+0200 (Eastern European Standard Time)
     timestamp = datetime.utcnow().strftime('%a %d %b %Y %H:%M:%S GMT')
-
     cert_info_data = {
+        # '_': '',
         'SSL_STATUS.XML': '(0,0)',
         'time_stamp': timestamp  # 'Thu Jul 12 2018 19:52:48 GMT+0300 (FLE Daylight Time)'
     }
 
-    for cookie in session.cookies:
-        print(cookie)
-    ipmi_info_url = IPMI_CERT_INFO_URL % url
+    ipmi_headers = {
+        "Origin": url,
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    ipmi_info_url = IPMI_QUERY_URL % url
     try:
-        result = session.post(ipmi_info_url, cert_info_data, timeout=REQUEST_TIMEOUT, verify=False)
+        result = session.post(ipmi_info_url, cert_info_data,
+                              headers=ipmi_headers, timeout=REQUEST_TIMEOUT, verify=False)
     except ConnectionError:
         return False
     if not result.ok:
+        return False
+    if result.headers['Content-Type'] != 'application/xml':
         return False
 
     root = etree.fromstring(result.text)
@@ -108,6 +157,43 @@ def get_ipmi_cert_info(session, url):
     }
 
 
+def prepare_for_cert_upload(session, url):
+    timestamp = datetime.utcnow().strftime('%a %d %b %Y %H:%M:%S GMT')
+    cert_info_data = {
+        'SSL_VALIDATE.XML=(0,0)'
+        'time_stamp': timestamp  # 'Thu Jul 12 2018 19:52:48 GMT+0300 (FLE Daylight Time)'
+    }
+
+    ipmi_headers = {
+        "Origin": url,
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    ipmi_info_url = IPMI_QUERY_URL % url
+    try:
+        result = session.post(ipmi_info_url, cert_info_data,
+                              headers=ipmi_headers, timeout=REQUEST_TIMEOUT, verify=False)
+    except ConnectionError:
+        return False
+    if not result.ok:
+        return False
+
+    # Don't try to parse XML, if response isn't one.
+    if result.headers['Content-Type'] != 'application/xml':
+        return False
+
+    root = etree.fromstring(result.text)
+    # <?xml> <IPMI> <SSL_INFO> <STATUS>
+    validate = root.xpath('//IPMI/SSL_INFO/VALIDATE')
+    if not validate:
+        return False
+    # Since xpath will return a list, just pick the first one from it.
+    validate = validate[0]
+    cert_idx = validate.get('CERT')
+    key_idx = validate.get('KEY')
+
+    return
+
+
 def upload_cert(session, url, key_file, cert_file):
     """
     Send X.509 certificate and private key to server
@@ -118,28 +204,60 @@ def upload_cert(session, url, key_file, cert_file):
     :param cert_file: filename to X.509 certificate PEM
     :return:
     """
+
+    # 1st operation:
+    # Upload the X.509 certificate
     with open(key_file, 'rb') as filehandle:
         key_data = filehandle.read()
     with open(cert_file, 'rb') as filehandle:
         cert_data = filehandle.read()
     files_to_upload = [
-        ('/tmp/cert.key', ('cert.key', key_data, 'application/octet-stream')),
-        ('/tmp/cert.pem', ('cert.pem', cert_data, 'application/x-x509-ca-cert'))
+        ('/tmp/cert.pem', ('cert.cer', cert_data, 'application/x-x509-ca-cert')),
+        ('/tmp/key.pem', ('cert.key', key_data, 'application/octet-stream'))
     ]
+
+    request_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:62.0) Gecko/20100101 Firefox/62.0",
+        "Referer": CONFIG_CERT_URL % url,
+        "Upgrade-Insecure-Requests": "1",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache"
+    }
 
     upload_cert_url = UPLOAD_CERT_URL % url
     try:
-        result = session.post(upload_cert_url, files=files_to_upload, timeout=REQUEST_TIMEOUT, verify=False)
+        req = requests.Request('POST', upload_cert_url, headers=request_headers, files=files_to_upload)
+        prepped = session.prepare_request(req)
+        result = session.send(prepped, timeout=REQUEST_TIMEOUT, verify=False)
     except ConnectionError:
         return False
     if not result.ok:
         return False
 
+    if 'Content-Length' not in result.headers.keys() or int(result.headers['Content-Length']) < 400:
+        # On failure, a tiny quirks-mode HTML-page will be returned.
+        # The page has nothing else, than a JavaScript-check for frames in it.
+        print("\nDEBUG, Way too tiny response!")
+        return False
+
     if 'Content-Type' not in result.headers.keys() or result.headers['Content-Type'] != 'text/html':
         # On failure, Content-Type will be 'text/plain' and 'Transfer-Encoding' is 'chunked'
+        print("\nDEBUG, Didn't get Content-Type: text/html")
         return False
     if 'CONFPAGE_RESET' not in result.text:
+        print("\nDEBUG, Word 'CONFPAGE_RESET' not in result body")
         return False
+
+    # 2nd operation:
+    # Validate cert:
+    cert_verify = prepare_for_cert_upload(session, url)
+
+    # 3rd operation:
+    # Get the uploaded cert stats
+    # ... will be done on main()
 
     return True
 
@@ -159,9 +277,6 @@ def reboot_ipmi(session, url):
     if not result.ok:
         return False
 
-    print("Url: %s" % upload_cert_url)
-    print(result.headers)
-    print(result.text)
     if '<STATE CODE="OK"/>' not in result.text:
         return False
 
@@ -180,8 +295,10 @@ def main():
                         help='IPMI username with admin access')
     parser.add_argument('--password', required=True,
                         help='IPMI user password')
-    parser.add_argument('--no-reboot',
+    parser.add_argument('--no-reboot', action='store_true',
                         help='The default is to reboot the IPMI after upload for the change to take effect.')
+    parser.add_argument('--requests-debug-level', type=int, default=0,
+                        help='Debug: Increase requests-library verbosity')
     args = parser.parse_args()
 
     # Confirm args
@@ -194,20 +311,36 @@ def main():
     if args.ipmi_url[-1] == '/':
         args.ipmi_url = args.ipmi_url[0:-1]
 
+    # XXX
+    if args.requests_debug_level == 1:
+        # Some logging!
+        http_client.HTTPConnection.debuglevel = 1
+        logging.basicConfig(level=logging.DEBUG)
+    elif args.requests_debug_level > 1:
+        # Max logging!
+        http_client.HTTPConnection.debuglevel = 1
+        logging.basicConfig()
+        logging.getLogger().setLevel(logging.DEBUG)
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.DEBUG)
+        requests_log.propagate = True
+
     # Start the operation
+    # Need to disable server certificate check to overcome any situation where IPMI cert has already expired.
     requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
     session = requests.session()
     if not login(session, args.ipmi_url, args.username, args.password):
         print("Login failed. Cannot continue!")
         exit(2)
 
-
     # Set mandatory cookies:
     url_parts = urlparse(args.ipmi_url)
     # Cookie: langSetFlag=0; language=English; SID=<dynamic session ID here!>; mainpage=configuration; subpage=config_ssl
     mandatory_cookies = {
+        # Language cookies are set in JavaScript (util.js)
         'langSetFlag': '0',
         'language': 'English',
+        # Navigation cookies are set by per-page navigation JavaScript
         'mainpage': 'configuration',
         'subpage': 'config_ssl'
     }
@@ -220,6 +353,8 @@ def main():
         exit(2)
     if cert_info['has_cert']:
         print("There exists a certificate, which is valid until: %s" % cert_info['valid_until'])
+    else:
+        print("No existing certificate info. Probably a failure? Continuing.")
 
     # Go upload!
     if not upload_cert(session, args.ipmi_url, args.key_file, args.cert_file):
