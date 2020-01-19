@@ -18,6 +18,9 @@
 #
 # Copyright (c) Jari Turkia
 
+# Further details available at my blog:
+# https://blog.hqcodeshop.fi/archives/410-Automating-IPMI-2.0-management-Lets-Encrypt-certificate-update.html
+
 
 import os
 import argparse
