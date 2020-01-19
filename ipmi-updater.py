@@ -25,23 +25,10 @@ import requests
 from datetime import datetime
 from lxml import etree
 from urllib.parse import urlparse
-import time
 
 # Debug connections
 import logging
 import http.client as http_client
-
-# For overwritten_encode_files()
-from urllib3.fields import RequestField
-from urllib3.filepost import encode_multipart_formdata
-from requests.utils import (
-    guess_filename, get_auth_from_url, requote_uri,
-    stream_decode_response_unicode, to_key_val_list, parse_header_links,
-    iter_slices, guess_json_utf, super_len, check_header_validity)
-from requests.compat import (
-    Callable, Mapping,
-    cookielib, urlunparse, urlsplit, urlencode, str, bytes,
-    is_py2, chardet, builtin_str, basestring)
 
 REQUEST_TIMEOUT = 5.0
 
