@@ -67,6 +67,22 @@ certbot renew --deploy-hook "/path/to/ipmi-updater.py \
 | `--force-update` | Update even if cert expiry matches |
 | `--quiet` | Suppress output on success |
 | `--debug` | Enable debug output |
+| `--force-ecdsa` | Allow ECDSA certificates on unsupported models |
+
+## Certificate Key Type Support
+
+| Model | RSA | ECDSA |
+|-------|-----|-------|
+| X9    | Yes | No    |
+| X10   | Yes | No    |
+| X11   | Yes | Untested |
+| X12/X13 | Yes | Yes |
+
+**Note:** ECDSA certificates on X9/X10 will upload successfully and pass validation, but the old certificate will still be served after reboot. Use RSA certificates for these models:
+
+```bash
+certbot certonly --key-type rsa -d ipmi.example.com
+```
 
 ## How it works
 

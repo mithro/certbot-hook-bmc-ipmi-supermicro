@@ -35,6 +35,15 @@ from urllib.parse import urlparse
 
 REQUEST_TIMEOUT = 5.0
 
+# ECDSA certificate support by model
+# X9/X10 will silently fail: upload succeeds, validation passes, but old cert remains after reboot
+MODEL_ECDSA_SUPPORT = {
+    "X9": "unsupported",
+    "X10": "unsupported",
+    "X11": "unknown",    # May work on some boards
+    "X12": "supported",
+}
+
 class IPMIUpdater:
     def __init__(self, session, ipmi_url):
         self.session = session
@@ -482,12 +491,28 @@ class IPMIX12Updater(IPMIUpdater):
             'key_file' : key_data
         }
 
-def parse_valid_until(pem):
-    from datetime import datetime, timezone
+def parse_cert_info(pem_file):
+    """Parse certificate info: expiry date and key type."""
     from OpenSSL import crypto as c
-    with open(pem, 'rb') as fh:
+    with open(pem_file, 'rb') as fh:
         cert = c.load_certificate(c.FILETYPE_PEM, fh.read())
-    return datetime.strptime(cert.get_notAfter().decode('utf8'), "%Y%m%d%H%M%SZ")
+
+    valid_until = datetime.strptime(cert.get_notAfter().decode('utf8'), "%Y%m%d%H%M%SZ")
+
+    key_type_id = cert.get_pubkey().type()
+    if key_type_id == c.TYPE_RSA:
+        key_type = "RSA"
+    elif key_type_id == 408:  # EC key (TYPE_EC not always defined)
+        key_type = "ECDSA"
+    else:
+        key_type = "OTHER"
+
+    return {'valid_until': valid_until, 'key_type': key_type}
+
+
+def parse_valid_until(pem):
+    """Wrapper for backward compatibility."""
+    return parse_cert_info(pem)['valid_until']
 
 def create_updater(args):
     session = requests.session()
@@ -604,6 +629,8 @@ def main():
                         help='Do not output anything if successful')
     parser.add_argument('--debug', action='store_true',
                         help='Output additional debugging')
+    parser.add_argument('--force-ecdsa', action='store_true',
+                        help='Allow ECDSA certificates on models that may not support them')
     args = parser.parse_args()
 
     # Confirm args
@@ -660,7 +687,26 @@ def main():
     if not args.quiet and cert_info['has_cert']:
         print("There exists a certificate, which is valid until: %s" % cert_info['valid_until'])
 
-    new_valid_until = parse_valid_until(args.cert_file)
+    cert_file_info = parse_cert_info(args.cert_file)
+    new_valid_until = cert_file_info['valid_until']
+    new_key_type = cert_file_info['key_type']
+
+    # Check ECDSA compatibility
+    if new_key_type == "ECDSA":
+        ecdsa_support = MODEL_ECDSA_SUPPORT.get(args.model, "unknown")
+        if ecdsa_support == "unsupported" and not args.force_ecdsa:
+            print(f"ERROR: ECDSA certificates are not supported on {args.model} BMCs.")
+            print("The certificate will upload and appear valid, but the old certificate")
+            print("will still be served after reboot.")
+            print("")
+            print("Use an RSA certificate instead:")
+            print("  certbot certonly --key-type rsa ...")
+            print("")
+            print("Or use --force-ecdsa to attempt anyway (not recommended).")
+            exit(2)
+        elif ecdsa_support == "unknown":
+            print(f"WARNING: ECDSA support on {args.model} is untested and may not work.")
+
     if current_valid_until == new_valid_until:
         if not args.force_update:
             print("New cert validity period matches existing cert, nothing to do")
