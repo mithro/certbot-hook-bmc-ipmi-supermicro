@@ -94,3 +94,7 @@ cython_debug/
 
 # Claude Code
 .claude
+
+# Temporary files and directories
+.tmp*
+.tmp-*/
